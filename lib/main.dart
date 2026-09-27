@@ -1,4 +1,9 @@
 import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:nearby_connections/nearby_connections.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 
 void main() => runApp(const TooleApp());
@@ -126,6 +131,166 @@ class _AppStringsDelegate extends LocalizationsDelegate<AppStrings> {
   @override bool shouldReload(_AppStringsDelegate old) => false;
 }
 
+
+class NearbyConnectionService {
+  final Nearby nearby = Nearby();
+
+  final Map<String, String> endpoints = {};
+  final List<String> messages = [];
+
+  bool advertising = false;
+  bool discovering = false;
+  String? connectedEndpointId;
+
+  Future<bool> requestPermissions() async {
+    final permissions = <Permission>[
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.bluetoothAdvertise,
+      Permission.locationWhenInUse,
+    ];
+
+    final results = await permissions.request();
+
+    return results.values.every(
+      (status) =>
+          status.isGranted || status.isLimited,
+    );
+  }
+
+  Future<void> start({
+    required String nickname,
+    required void Function(String endpointId, String name) onFound,
+    required void Function(String message) onMessage,
+    required void Function(String status) onStatus,
+  }) async {
+    final allowed = await requestPermissions();
+
+    if (!allowed) {
+      onStatus('Permissions Bluetooth refusées');
+      return;
+    }
+
+    const strategy = Strategy.P2P_STAR;
+
+    advertising = await nearby.startAdvertising(
+      nickname,
+      strategy,
+      onConnectionInitiated: (endpointId, connectionInfo) async {
+        onStatus('Demande de connexion reçue');
+
+        await nearby.acceptConnection(
+          endpointId,
+          onPayLoadRecieved: (id, payload) {
+            final text = utf8.decode(payload.bytes!);
+            messages.add(text);
+            onMessage(text);
+          },
+        );
+      },
+      onConnectionResult: (endpointId, status) {
+        if (status == Status.CONNECTED) {
+          connectedEndpointId = endpointId;
+          onStatus('Connecté');
+        } else if (status == Status.REJECTED) {
+          onStatus('Connexion refusée');
+        } else {
+          onStatus('Erreur de connexion');
+        }
+      },
+      onDisconnected: (endpointId) {
+        if (connectedEndpointId == endpointId) {
+          connectedEndpointId = null;
+        }
+        onStatus('Déconnecté');
+      },
+    );
+
+    discovering = await nearby.startDiscovery(
+      nickname,
+      strategy,
+      onEndpointFound: (endpointId, endpointName, serviceId) {
+        endpoints[endpointId] = endpointName;
+        onFound(endpointId, endpointName);
+      },
+      onEndpointLost: (endpointId) {
+        if (endpointId != null) {
+          endpoints.remove(endpointId);
+        }
+      },
+    );
+
+    onStatus(
+      advertising || discovering
+          ? 'Recherche des appareils à proximité...'
+          : 'Impossible de démarrer la recherche',
+    );
+  }
+
+  Future<void> connect(
+    String nickname,
+    String endpointId,
+    void Function(String status) onStatus,
+  ) async {
+    final result = await nearby.requestConnection(
+      nickname,
+      endpointId,
+      onConnectionInitiated: (id, connectionInfo) async {
+        await nearby.acceptConnection(
+          id,
+          onPayLoadRecieved: (endpointId, payload) {
+            final text = utf8.decode(payload.bytes!);
+            messages.add(text);
+          },
+        );
+      },
+      onConnectionResult: (id, status) {
+        if (status == Status.CONNECTED) {
+          connectedEndpointId = id;
+          onStatus('Connecté');
+        } else if (status == Status.REJECTED) {
+          onStatus('Connexion refusée');
+        } else {
+          onStatus('Erreur de connexion');
+        }
+      },
+      onDisconnected: (id) {
+        if (connectedEndpointId == id) {
+          connectedEndpointId = null;
+        }
+        onStatus('Déconnecté');
+      },
+    );
+
+    if (!result) {
+      onStatus('Échec de la demande de connexion');
+    }
+  }
+
+  Future<void> send(String text) async {
+    final endpointId = connectedEndpointId;
+
+    if (endpointId == null || text.trim().isEmpty) {
+      return;
+    }
+
+    await nearby.sendBytesPayload(
+      endpointId,
+      Uint8List.fromList(utf8.encode(text)),
+    );
+  }
+
+  Future<void> stop() async {
+    await nearby.stopAdvertising();
+    await nearby.stopDiscovery();
+    await nearby.stopAllEndpoints();
+
+    advertising = false;
+    discovering = false;
+    connectedEndpointId = null;
+    endpoints.clear();
+  }
+}
 class AuthScreen extends StatefulWidget {
   final AppState state;
   const AuthScreen({super.key, required this.state});
